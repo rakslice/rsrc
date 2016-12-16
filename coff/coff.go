@@ -12,6 +12,9 @@ import (
 	"strings"
 
 	"github.com/rakslice/rsrc/binutil"
+	"fmt"
+	"os"
+	"syscall"
 )
 
 type Dir struct { // struct IMAGE_RESOURCE_DIRECTORY
@@ -31,6 +34,11 @@ type Dirs []Dir
 type DirEntry struct { // struct IMAGE_RESOURCE_DIRECTORY_ENTRY
 	NameOrId     uint32
 	OffsetToData uint32
+}
+
+type DirString struct { // struct IMAGE_RESOURCE_DIR_STRING_U
+	CharacterCount uint16
+	Characters[]   uint16
 }
 
 type DataEntry struct { // struct IMAGE_RESOURCE_DATA_ENTRY
@@ -72,6 +80,7 @@ type StringsHeader struct {
 
 const (
 	MASK_SUBDIRECTORY = 1 << 31
+	MASK_NAME uint32 = 1 << 31
 
 	RT_ICON       = 3
 	RT_GROUP_ICON = 3 + 11
@@ -101,6 +110,7 @@ type Coff struct {
 
 	*Dir
 	DataEntries []DataEntry
+	DirStrings  []DirString
 	Data        []Sizer
 
 	Relocations []RelocationEntry
@@ -127,6 +137,8 @@ func NewRDATA() *Coff {
 		// "directory hierarchy" of .rsrc section; empty for .data function
 		nil,
 		[]DataEntry{},
+
+		[]DirString{},
 
 		[]Sizer{},
 
@@ -217,6 +229,7 @@ func NewRSRC() *Coff {
 		&Dir{},
 
 		[]DataEntry{},
+		[]DirString{},
 		[]Sizer{},
 
 		[]RelocationEntry{},
@@ -237,9 +250,13 @@ func NewRSRC() *Coff {
 	}
 }
 
+func (coff *Coff) AddResource(kind uint32, id uint16, data Sizer) {
+	coff.AddResourceIdOrNameRef(kind, uint32(id), data)
+}
+
 //NOTE: function assumes that 'id' is increasing on each entry
 //NOTE: only usable for Coff created using NewRSRC
-func (coff *Coff) AddResource(kind uint32, id uint16, data Sizer) {
+func (coff *Coff) AddResourceIdOrNameRef(kind uint32, idOrName uint32, data Sizer) {
 	re := RelocationEntry{
 		// "(zero based) index in the Symbol table to which the
 		// reference refers.  Once you have loaded the COFF file into
@@ -273,7 +290,7 @@ func (coff *Coff) AddResource(kind uint32, id uint16, data Sizer) {
 	coff.Dir.Dirs = dirs0
 
 	// for second level, assume ID is always increasing, so we don't have to sort
-	dirs0[i0].DirEntries = append(dirs0[i0].DirEntries, DirEntry{NameOrId: uint32(id)})
+	dirs0[i0].DirEntries = append(dirs0[i0].DirEntries, DirEntry{NameOrId: idOrName})
 	dirs0[i0].Dirs = append(dirs0[i0].Dirs, Dir{
 		NumberOfIdEntries: 1,
 		DirEntries:        DirEntries{LANG_ENTRY},
@@ -318,14 +335,19 @@ func (coff *Coff) freezeCommon1(path string, offset, diroff uint32) (newdiroff u
 
 func freezeCommon2(v reflect.Value, offset *uint32) error {
 	if binutil.Plain(v.Kind()) {
-		*offset += uint32(binary.Size(v.Interface())) // TODO: change to v.Type().Size() ?
+		curSize := uint32(binary.Size(v.Interface()))
+		fmt.Fprintf(os.Stderr, "binUtil.Plain; added %d to offset\n", curSize)
+		*offset += curSize // TODO: change to v.Type().Size() ?
 		return nil
 	}
 	vv, ok := v.Interface().(Sizer)
 	if ok {
-		*offset += uint32(vv.Size())
+		curSize := uint32(vv.Size())
+		fmt.Fprintf(os.Stderr, "Sizer; added %d to offset\n", curSize)
+		*offset += curSize
 		return binutil.WALK_SKIP
 	}
+	fmt.Fprintf(os.Stderr, "NB: Path has no size\n")
 	return nil
 }
 
@@ -356,7 +378,26 @@ func (coff *Coff) freezeRDATA() {
 	coff.SectionHeader32.PointerToRelocations = 0
 }
 
+type DirEntriesMap map[uint32][]*DirEntry
+
+func freezeDirEntry(entry *DirEntry, offset uint32, diroff uint32, dirEntriesByDirStringIndex *DirEntriesMap) {
+	entry.OffsetToData = MASK_SUBDIRECTORY | (offset - diroff)
+	if entry.NameOrId & MASK_NAME == MASK_NAME {
+		dirStringIndex := entry.NameOrId & ^MASK_NAME
+		// this is currently holding the index of the DirString but should be the offset of the DirString,
+		// so keep track of it so we can replace it once we know it
+		_, exists := (*dirEntriesByDirStringIndex)[dirStringIndex]
+		if !exists {
+			(*dirEntriesByDirStringIndex)[dirStringIndex] = []*DirEntry{}
+		}
+		(*dirEntriesByDirStringIndex)[dirStringIndex] = append((*dirEntriesByDirStringIndex)[dirStringIndex], entry)
+	}
+}
+
 func (coff *Coff) freezeRSRC() {
+	// map of DirString indexes to entries that used them
+	dirEntriesByDirStringIndex := make(DirEntriesMap)
+
 	leafwalker := make(chan *DirEntry)
 	go func() {
 		for _, dir1 := range coff.Dir.Dirs { // resource type
@@ -370,6 +411,7 @@ func (coff *Coff) freezeRSRC() {
 
 	var offset, diroff uint32
 	binutil.Walk(coff, func(v reflect.Value, path string) error {
+		fmt.Fprintf(os.Stderr, "freezeRSRC() walk processing path '%s'\n", path)
 		diroff = coff.freezeCommon1(path, offset, diroff)
 
 		RE := regexp.MustCompile
@@ -377,9 +419,9 @@ func (coff *Coff) freezeRSRC() {
 		m := matcher{}
 		switch {
 		case m.Find(path, RE("^/Dir/Dirs"+N+"$")):
-			coff.Dir.DirEntries[m[0]].OffsetToData = MASK_SUBDIRECTORY | (offset - diroff)
+			freezeDirEntry(&coff.Dir.DirEntries[m[0]], offset, diroff, &dirEntriesByDirStringIndex)
 		case m.Find(path, RE("^/Dir/Dirs"+N+"/Dirs"+N+"$")):
-			coff.Dir.Dirs[m[0]].DirEntries[m[1]].OffsetToData = MASK_SUBDIRECTORY | (offset - diroff)
+			freezeDirEntry(&coff.Dir.Dirs[m[0]].DirEntries[m[1]], offset, diroff, &dirEntriesByDirStringIndex)
 		case m.Find(path, RE("^/DataEntries"+N+"$")):
 			direntry := <-leafwalker
 			direntry.OffsetToData = offset - diroff
@@ -387,6 +429,23 @@ func (coff *Coff) freezeRSRC() {
 			coff.Relocations[m[0]].RVA = offset - diroff
 		case m.Find(path, RE("^/Data"+N+"$")):
 			coff.DataEntries[m[0]].OffsetToData = offset - diroff
+		case m.Find(path, RE("^/DirStrings"+N+"$")):
+			fmt.Fprintf(os.Stderr, "Procesing DirString #%d '%s'\n", m[0], syscall.UTF16ToString(coff.DirStrings[m[0]].Characters))
+			dirStringIndex := uint32(m[0])
+			entriesUsingString, gotEntries := dirEntriesByDirStringIndex[dirStringIndex]
+			if gotEntries {
+				offsetToNameString := offset - diroff
+				fmt.Fprintf(os.Stderr, "At offset 0x%08x\n", offsetToNameString)
+				for i, entry := range entriesUsingString {
+					fmt.Fprintf(os.Stderr, "processing DirEntry #%d (%s)\n", i, entry)
+					if entry.NameOrId != MASK_NAME | dirStringIndex {
+						fmt.Fprintf(os.Stderr, "WARNING: expected entry set to index but was 0x%08x\n", entry.NameOrId)
+					}
+					entry.NameOrId = MASK_NAME | offsetToNameString
+				}
+			} else {
+				fmt.Fprintf(os.Stderr, "WARNING: No entries for this string\n")
+			}
 		}
 
 		return freezeCommon2(v, &offset)
